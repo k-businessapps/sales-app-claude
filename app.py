@@ -200,7 +200,6 @@ def _filter_leads_initial(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     initial_len = len(out)
     
     # Country Filter (Person - Country != India)
-    # Check flexible names
     country_col = _pick_first_existing_column(out, ["Person - Country", "Country", "Person Country"])
     if country_col:
         out = out[out[country_col].astype(str).str.strip().str.lower() != "india"]
@@ -208,7 +207,6 @@ def _filter_leads_initial(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     # Label Filter (Does not contain "Junk Lead")
     label_col = _pick_first_existing_column(out, ["Lead - Label", "Label", "Labels", "Lead - Labels"])
     if label_col:
-        # Filter where label contains "junk lead" (case insensitive)
         mask = out[label_col].astype(str).str.contains("junk lead", case=False, na=False)
         out = out[~mask]
     
@@ -301,7 +299,8 @@ def _strict_range_email_summary(
     amount_col: str, refund_amount_col: str
 ) -> pd.DataFrame:
     def get_sums(df, out_col):
-        if df.empty: return pd.Series(dtype=float)
+        if df.empty: 
+            return pd.Series(dtype=float, name=out_col)
         return df.groupby("email")[amount_col if "Total" in out_col else refund_amount_col].sum().rename(out_col)
 
     p_gross = get_sums(payments_gross, "Period_Total_Amount")
@@ -312,6 +311,12 @@ def _strict_range_email_summary(
     df = pd.concat([p_gross, p_ce, r_gross, r_ce], axis=1).fillna(0.0)
     df.index.name = "email"
     df = df.reset_index()
+    
+    # Ensure columns exist even if inputs were empty
+    expected = ["Period_Total_Amount", "Period_Total_Amount_creditExcluded", "Period_Refund_Amount", "Period_Refund_Amount_creditExcluded"]
+    for c in expected:
+        if c not in df.columns: df[c] = 0.0
+    
     df["Period_Net_Amount"] = df["Period_Total_Amount"] - df["Period_Refund_Amount"]
     df["Period_Net_Amount_creditExcluded"] = df["Period_Total_Amount_creditExcluded"] - df["Period_Refund_Amount_creditExcluded"]
     return df
@@ -606,10 +611,6 @@ def main():
             rev = dedup_df.groupby(group_cols, as_index=False)[["Period_Net_Amount", "Net_Amount"]].sum()
             rev.columns = group_cols + ["Sales Revenue Total - Full Duration", "Sales Revenue (7 days)"]
             # 3. Paying Users (from dedup rows where Revenue > 0)
-            # Use 'Overall Conversions' definition? Or just any revenue? 
-            # Usually tables imply any revenue, but let's stick to "Conversions" subset if strict.
-            # However, prompt says "Sales Attempted Total Conversions" is the count.
-            # Let's count unique emails with > 0 revenue in strict period or 7d.
             has_rev = dedup_df[(dedup_df["Period_Total_Amount"] > 0) | (dedup_df["Total_Amount"] > 0)]
             payers = has_rev.groupby(group_cols, as_index=False)["email"].nunique().rename(columns={"email": "Paying Users"})
             
