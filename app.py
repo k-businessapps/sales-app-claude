@@ -679,8 +679,8 @@ def main():
             mask_country = expanded_leads[country_col].apply(_norm_text) != "india"
 
         mask_junk = pd.Series([True] * len(expanded_leads), index=expanded_leads.index)
-        if labels_col and labels_col in expanded_leads.columns:
-            mask_junk = ~expanded_leads[labels_col].astype(str).str.contains("Junk Lead", case=False, na=False)
+        if label_col and label_col in expanded_leads.columns:
+            mask_junk = ~expanded_leads[label_col].astype(str).str.contains("Junk Lead", case=False, na=False)
 
         before_leads = len(expanded_leads)
         expanded_leads = expanded_leads.loc[mask_country & mask_junk].copy()
