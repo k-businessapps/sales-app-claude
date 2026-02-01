@@ -567,12 +567,11 @@ def main():
         st.markdown("### Date Selection")
         today = date.today()
         first_of_month = today.replace(day=1)
-        default_start = first_of_month - timedelta(days=4)
+        default_start = first_of_month
         default_end = today - timedelta(days=1)
         from_date = st.date_input("Date from", value=default_start)
         to_date = st.date_input("Date to", value=default_end)
         st.markdown("---")
-        st.markdown("### Rules")
 
     st.markdown('<div class="kc-card">', unsafe_allow_html=True)
     leads_file = st.file_uploader("Upload Leads CSV", type=["csv"])
