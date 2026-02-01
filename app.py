@@ -573,11 +573,6 @@ def main():
         to_date = st.date_input("Date to", value=default_end)
         st.markdown("---")
         st.markdown("### Rules")
-        st.info("Summaries exclude owner: Pipedrive KrispCall. Main tables still include it.")
-        st.info("Time summary groups by Lead created date.")
-        st.info("Lead Counts are before deduplication.")
-        st.info("Overall Conversion = unique emails with Workspace Subscription payment.")
-        st.info("Sales Conversions Count + Self-Converted Count must equal Overall Conversion. This is audited.")
 
     st.markdown('<div class="kc-card">', unsafe_allow_html=True)
     leads_file = st.file_uploader("Upload Leads CSV", type=["csv"])
