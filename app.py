@@ -601,7 +601,7 @@ def main():
 
         expanded_leads, missing_rows = _expand_leads_for_multiple_emails(leads_raw, email_cols_priority)
         if missing_rows:
-            logs.append(f"Missing email for {len(missing_rows)} lead row(s).")
+            logs.append(f"Missing email for {len(missing_rows)} raw lead row(s). These rows are excluded from analysis.")
 
         if label_col and label_col in expanded_leads.columns:
             expanded_leads["labels_list"] = expanded_leads[label_col].apply(_split_labels)
@@ -618,6 +618,13 @@ def main():
         expanded_leads["email"] = expanded_leads["email"].apply(
             lambda x: str(x).strip().lower() if x is not None and str(x).strip() != "" else None
         )
+
+        # Filter out blank / missing emails entirely before any counts, joins, or summaries.
+        pre_filter_lead_rows = len(expanded_leads)
+        expanded_leads = expanded_leads[expanded_leads["email"].notna()].copy()
+        filtered_empty_email_rows = pre_filter_lead_rows - len(expanded_leads)
+        if filtered_empty_email_rows:
+            logs.append(f"Filtered out {filtered_empty_email_rows} expanded lead row(s) with empty email.")
 
         # Lead Count metrics base (before dedup). Exclude India and Junk Lead for Leads Generated.
         country_col = _pick_first_existing_column(leads_raw, ["Person - Country", "Country", "Person Country"])
@@ -836,6 +843,18 @@ def main():
                 f"AUDIT FAIL: Sales Effort Conversions {sales_effort_conversions_count} > Sales Conversions {sales_conversions_count}"
             )
 
+        # Canonical summary attribution base.
+        # Use only Sales Conversion emails, and deduplicate to one non-Pipedrive lead row per email
+        # before building owner / connected / time summaries.
+        summary_attr = summ_dedup[summ_dedup["email"].isin(sales_conversion_emails_set)].copy()
+        summary_attr["Converted_User"] = 1
+
+        missing_summary_attr_emails = sorted(list(sales_conversion_emails_set - set(summary_attr["email"].dropna().unique())))
+        if missing_summary_attr_emails:
+            logs.append(
+                f"AUDIT FAIL: {len(missing_summary_attr_emails)} Sales Conversion email(s) could not be attributed to the deduped non-Pipedrive summary base."
+            )
+
         # Segment revenue helpers
         def calc_segment_metrics(emails_list: List[str]):
             if not emails_list:
@@ -868,9 +887,9 @@ def main():
         # Overall Metrics table
         overall_metrics_data = [
             {"Group": "Overall", "Metric": "Overall Revenue (Period)", "Value": metric_overall_revenue, "Description": "Payments minus refunds in selected range"},
-            {"Group": "Overall", "Metric": "Overall Conversion", "Value": metric_overall_conversions, "Description": "Unique emails with Workspace Subscription payment"},
+            {"Group": "Overall", "Metric": "Overall Conversion", "Value": metric_overall_conversions, "Description": 'Unique emails where Amount Description contains "Workspace Subscription"'},
 
-            {"Group": "Self Converted", "Metric": "Self-Converted Count (Conversion Count)", "Value": self_converted_count, "Description": "Workspace Subscription emails with no lead, or deduped first lead owner is Pipedrive KrispCall"},
+            {"Group": "Self Converted", "Metric": "Self-Converted Count (Conversion Count)", "Value": self_converted_count, "Description": 'Conversion emails where Amount Description contains "Workspace Subscription", with no lead or first deduped lead owner = Pipedrive KrispCall'},
             {"Group": "Self Converted", "Metric": "Self-Converted Net Revenue (Whole Period)", "Value": sc_period_net, "Description": "Net revenue in range for self converted conversion emails"},
             {"Group": "Self Converted", "Metric": "Self-Converted Net Revenue (7 day)", "Value": sc_7d_net, "Description": "7-day window net revenue for self converted conversion emails"},
 
@@ -890,54 +909,48 @@ def main():
         # Summaries Construction
         summ_cols = numeric_cols_7d + numeric_cols_period
 
-        def build_summary(group_cols: List[str], df_base: pd.DataFrame, df_dedup: pd.DataFrame):
-            rev = df_dedup.groupby(group_cols, as_index=False)[summ_cols].sum()
-            counts = df_base.groupby(group_cols, as_index=False).size().rename(columns={"size": "Lead_Count"})
+        def build_summary(group_cols: List[str], df_attr: pd.DataFrame):
+            if df_attr.empty:
+                return pd.DataFrame(columns=group_cols + summ_cols + ["Lead_Count", "Converted_Users", "Paying_Users"])
 
-            pay_mask = (df_base["Period_Total_Amount"] > 0) | (df_base["Total_Amount"] > 0)
-            payers = (
-                df_base[pay_mask]
-                .groupby(group_cols, as_index=False)["email"]
+            rev = df_attr.groupby(group_cols, dropna=False, as_index=False)[summ_cols].sum()
+            converted = (
+                df_attr.groupby(group_cols, dropna=False, as_index=False)["email"]
                 .nunique()
-                .rename(columns={"email": "Paying_Users"})
+                .rename(columns={"email": "Converted_Users"})
             )
 
-            final = rev.merge(counts, on=group_cols, how="outer")
-            final = final.merge(payers, on=group_cols, how="outer")
-            final = final.fillna(0)
+            final = rev.merge(converted, on=group_cols, how="outer").fillna(0)
+            final["Lead_Count"] = final["Converted_Users"]
+            # Backward-compatible column name for existing workbook readers.
+            final["Paying_Users"] = final["Converted_Users"]
+
+            ordered_cols = group_cols + ["Lead_Count", "Converted_Users", "Paying_Users"] + summ_cols
+            final = final[[c for c in ordered_cols if c in final.columns]]
 
             if "Period_Net_Amount" in final.columns:
                 final = final.sort_values("Period_Net_Amount", ascending=False)
             return final
 
-        owner_summary = build_summary([owner_col], summ_base, summ_dedup)
-        connected_summary = build_summary(["Connected"], summ_base, summ_dedup)
-        owner_x_connected = build_summary([owner_col, "Connected"], summ_base, summ_dedup)
+        owner_summary = build_summary([owner_col], summary_attr)
+        connected_summary = build_summary(["Connected"], summary_attr)
+        owner_x_connected = build_summary([owner_col, "Connected"], summary_attr)
 
-        labels_base = summ_base.explode("labels_list").rename(columns={"labels_list": "Label"})
-        labels_base["Label"] = labels_base["Label"].fillna("").astype(str).str.strip()
-        labels_base = labels_base[labels_base["Label"] != ""].copy()
-        labels_base["Connected_Label"] = labels_base["Label"].str.lower().apply(
+        labels_attr = summary_attr.explode("labels_list").rename(columns={"labels_list": "Label"})
+        labels_attr["Label"] = labels_attr["Label"].fillna("").astype(str).str.strip()
+        labels_attr = labels_attr[labels_attr["Label"] != ""].copy()
+        labels_attr["Connected_Label"] = labels_attr["Label"].str.lower().apply(
             lambda s: False if s.strip() == "not connected" else ("connected" in s)
         )
 
-        labels_dedup = summ_dedup.explode("labels_list").rename(columns={"labels_list": "Label"})
-        labels_dedup["Label"] = labels_dedup["Label"].fillna("").astype(str).str.strip()
-        labels_dedup = labels_dedup[labels_dedup["Label"] != ""].copy()
-        labels_dedup["Connected_Label"] = labels_dedup["Label"].str.lower().apply(
-            lambda s: False if s.strip() == "not connected" else ("connected" in s)
-        )
+        label_summary = build_summary(["Label", "Connected_Label"], labels_attr)
 
-        label_summary = build_summary(["Label", "Connected_Label"], labels_base, labels_dedup)
-
-        summ_base["Lead_Created_Date"] = summ_base["_lead_created_dt"].dt.date
-        summ_dedup["Lead_Created_Date"] = summ_dedup["_lead_created_dt"].dt.date
-        time_summary = build_summary(["Lead_Created_Date"], summ_base, summ_dedup).sort_values("Lead_Created_Date")
+        summary_attr["Lead_Created_Date"] = summary_attr["_lead_created_dt"].dt.date
+        time_summary = build_summary(["Lead_Created_Date"], summary_attr).sort_values("Lead_Created_Date")
 
         # Hour of day summary
-        summ_base["Lead_Created_Hour"] = pd.to_datetime(summ_base["_lead_created_dt"], errors="coerce").dt.hour
-        summ_dedup["Lead_Created_Hour"] = pd.to_datetime(summ_dedup["_lead_created_dt"], errors="coerce").dt.hour
-        hour_summary = build_summary(["Lead_Created_Hour"], summ_base, summ_dedup).copy()
+        summary_attr["Lead_Created_Hour"] = pd.to_datetime(summary_attr["_lead_created_dt"], errors="coerce").dt.hour
+        hour_summary = build_summary(["Lead_Created_Hour"], summary_attr).copy()
 
         def _hour_label(v):
             try:
@@ -971,6 +984,35 @@ def main():
             sc_summ_7d.merge(sc_summ_per, on="email", how="left")
             .sort_values("Period_Net_Amount", ascending=False)
         )
+
+        def _summary_total(df: pd.DataFrame, col: str) -> int:
+            if df is None or df.empty or col not in df.columns:
+                return 0
+            return int(pd.to_numeric(df[col], errors="coerce").fillna(0).sum())
+
+        owner_summary_total_converted = _summary_total(owner_summary, "Converted_Users")
+        connected_summary_total_converted = _summary_total(connected_summary, "Converted_Users")
+        owner_connected_summary_total_converted = _summary_total(owner_x_connected, "Converted_Users")
+        time_summary_total_converted = _summary_total(time_summary, "Converted_Users")
+        hour_summary_total_converted = _summary_total(hour_summary, "Converted_Users")
+
+        owner_summary_match = owner_summary_total_converted == sales_conversions_count
+        connected_summary_match = connected_summary_total_converted == sales_conversions_count
+        owner_connected_summary_match = owner_connected_summary_total_converted == sales_conversions_count
+        time_summary_match = time_summary_total_converted == sales_conversions_count
+        hour_summary_match = hour_summary_total_converted == sales_conversions_count
+
+        for label, ok, val in [
+            ("Owner Summary total", owner_summary_match, owner_summary_total_converted),
+            ("Connected Summary total", connected_summary_match, connected_summary_total_converted),
+            ("Owner x Connected total", owner_connected_summary_match, owner_connected_summary_total_converted),
+            ("Time Summary total", time_summary_match, time_summary_total_converted),
+            ("Hour Summary total", hour_summary_match, hour_summary_total_converted),
+        ]:
+            if not ok:
+                logs.append(
+                    f"AUDIT FAIL: {label} Converted_Users = {val}, expected Sales Conversions Count = {sales_conversions_count}"
+                )
 
         # Charts
         fig_owner, ax_owner = plt.subplots(figsize=(10, 6))
@@ -1037,6 +1079,12 @@ def main():
                 {"Check": "Conversion Partition", "Status": "PASS" if conversion_partition_ok else "FAIL", "Notes": "Overall Conversion equals Sales Conversions plus Self Converted"},
                 {"Check": "Effort Subset", "Status": "PASS" if effort_subset_ok else "FAIL", "Notes": "Sales Effort Conversions is subset of Sales Conversions"},
                 {"Check": "Lead Count Ordering", "Status": "PASS" if lead_count_relation_ok else "FAIL", "Notes": "Lead Connected <= Leads Attempted <= Leads Generated"},
+                {"Check": "Summary Attribution Coverage", "Status": "PASS" if not missing_summary_attr_emails else "FAIL", "Notes": "Every Sales Conversion email is present in the deduped non-Pipedrive summary base"},
+                {"Check": "Owner Summary Converted Total", "Status": "PASS" if owner_summary_match else "FAIL", "Notes": "Owner summary Converted_Users total equals Sales Conversions Count"},
+                {"Check": "Connected Summary Converted Total", "Status": "PASS" if connected_summary_match else "FAIL", "Notes": "Connected summary Converted_Users total equals Sales Conversions Count"},
+                {"Check": "Owner x Connected Converted Total", "Status": "PASS" if owner_connected_summary_match else "FAIL", "Notes": "Owner x Connected summary Converted_Users total equals Sales Conversions Count"},
+                {"Check": "Time Summary Converted Total", "Status": "PASS" if time_summary_match else "FAIL", "Notes": "Time summary Converted_Users total equals Sales Conversions Count"},
+                {"Check": "Hour Summary Converted Total", "Status": "PASS" if hour_summary_match else "FAIL", "Notes": "Hour summary Converted_Users total equals Sales Conversions Count"},
             ]
         )
 
@@ -1046,6 +1094,12 @@ def main():
                 {"Metric": "Self Converted emails", "Value": self_converted_count},
                 {"Metric": "Sales Conversion emails", "Value": sales_conversions_count},
                 {"Metric": "Sales Effort Conversion emails", "Value": sales_effort_conversions_count},
+                {"Metric": "Summary Attribution emails", "Value": int(summary_attr["email"].nunique()) if not summary_attr.empty else 0},
+                {"Metric": "Owner Summary Converted total", "Value": owner_summary_total_converted},
+                {"Metric": "Connected Summary Converted total", "Value": connected_summary_total_converted},
+                {"Metric": "Owner x Connected Converted total", "Value": owner_connected_summary_total_converted},
+                {"Metric": "Time Summary Converted total", "Value": time_summary_total_converted},
+                {"Metric": "Hour Summary Converted total", "Value": hour_summary_total_converted},
                 {"Metric": "Leads Generated (rows)", "Value": metric_leads_generated},
                 {"Metric": "Leads Attempted (rows)", "Value": metric_leads_attempted},
                 {"Metric": "Lead Connected (rows)", "Value": metric_leads_connected},
