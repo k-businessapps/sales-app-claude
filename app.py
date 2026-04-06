@@ -275,6 +275,94 @@ def _connected_from_labels(labels: List[str]) -> bool:
     return False
 
 
+def _clean_label_text(label: str) -> str:
+    return re.sub(r"\s+", " ", str(label or "").strip())
+
+
+def _derive_lead_source(labels: List[str]) -> str:
+    if not labels:
+        return ""
+
+    cleaned = [_clean_label_text(l) for l in labels if _clean_label_text(l)]
+    if not cleaned:
+        return ""
+
+    # Canonical source mapping. Checked against real labels seen in the workbook.
+    preferred_mappings = [
+        ("unpaid signup", "Unpaid Signups"),
+        ("newsletter", "Newsletter"),
+        ("enterprise leads", "Enterprise Leads"),
+        ("enterprise lead", "Enterprise Leads"),
+        ("crisp chat", "Crisp Chat"),
+        ("crispchat", "Crisp Chat"),
+        ("calendly", "Calendly"),
+    ]
+
+    # Non-source labels. These are disposition / qualification / status labels and
+    # should never become Lead Source.
+    excluded_exact = {
+        "connected",
+        "connected-call",
+        "connected-email",
+        "connected-wa",
+        "not connected",
+        "follow up",
+        "no response",
+        "not intrested",
+        "not interested",
+        "interested",
+        "voicemail",
+        "duplicate",
+        "language barrier",
+        "individual",
+        "business",
+        "junk lead",
+        "junk leads",
+        "junk deal",
+        "junk deals",
+        "bronze",
+        "silver",
+        "gold",
+        "platinum",
+        "vip",
+    }
+
+    excluded_contains = [
+        "connected",
+        "follow up",
+        "no response",
+        "not intrested",
+        "not interested",
+        "interested",
+        "voicemail",
+        "duplicate",
+        "language barrier",
+        "junk",
+        "individual",
+        "business",
+        "bronze",
+        "silver",
+        "gold",
+        "platinum",
+        "vip",
+    ]
+
+    lowered = [c.lower() for c in cleaned]
+    for low in lowered:
+        for pattern, canonical in preferred_mappings:
+            if pattern in low:
+                return canonical
+
+    for raw, low in zip(cleaned, lowered):
+        if low in excluded_exact:
+            continue
+        if any(token in low for token in excluded_contains):
+            continue
+        return raw
+
+    return ""
+
+
 def _expand_leads_for_multiple_emails(df: pd.DataFrame, email_cols_priority: List[str]) -> Tuple[pd.DataFrame, List[int]]:
     missing_rows: List[int] = []
     expanded = []
@@ -464,6 +552,8 @@ def _style_sheet(ws):
 def _build_excel(
     leads_with_payments: pd.DataFrame,
     leads_nonzero: pd.DataFrame,
+    deduped_leads_source: pd.DataFrame,
+    summary_attribution_base: pd.DataFrame,
     email_summary: pd.DataFrame,
     owner_summary: pd.DataFrame,
     owner_x_connected: pd.DataFrame,
@@ -504,6 +594,8 @@ def _build_excel(
 
     add_sheet("Leads_with_Payments", leads_with_payments, label_col=None)
     add_sheet("Leads_Payments_NonZero", leads_nonzero, label_col=None)
+    add_sheet("Leads_Deduped_By_Email", deduped_leads_source, label_col="email", add_totals=False)
+    add_sheet("Summary_Attribution_Base", summary_attribution_base, label_col="email", add_totals=False)
     add_sheet("Email_Summary", email_summary, label_col="email")
     add_sheet("Owner_Summary", owner_summary, label_col=owner_summary.columns[0] if not owner_summary.empty else None, add_totals=False)
     add_sheet("Owner_x_Connected", owner_x_connected, label_col=owner_x_connected.columns[0] if not owner_x_connected.empty else None)
@@ -609,6 +701,7 @@ def main():
             expanded_leads["labels_list"] = [[] for _ in range(len(expanded_leads))]
 
         expanded_leads["Connected"] = expanded_leads["labels_list"].apply(_connected_from_labels)
+        expanded_leads["Lead Source"] = expanded_leads["labels_list"].apply(_derive_lead_source)
 
         if created_col and created_col in expanded_leads.columns:
             expanded_leads["_lead_created_dt"] = pd.to_datetime(expanded_leads[created_col], errors="coerce")
@@ -625,6 +718,12 @@ def main():
         filtered_empty_email_rows = pre_filter_lead_rows - len(expanded_leads)
         if filtered_empty_email_rows:
             logs.append(f"Filtered out {filtered_empty_email_rows} expanded lead row(s) with empty email.")
+
+        deduped_leads_source = (
+            expanded_leads.sort_values(["email", "_lead_created_dt"], kind="mergesort")
+            .drop_duplicates(subset=["email"], keep="first")
+            .copy()
+        )
 
         # Lead Count metrics base (before dedup). Exclude India and Junk Lead for Leads Generated.
         country_col = _pick_first_existing_column(leads_raw, ["Person - Country", "Country", "Person Country"])
@@ -848,6 +947,8 @@ def main():
         # before building owner / connected / time summaries.
         summary_attr = summ_dedup[summ_dedup["email"].isin(sales_conversion_emails_set)].copy()
         summary_attr["Converted_User"] = 1
+        if "Lead Source" not in summary_attr.columns:
+            summary_attr["Lead Source"] = ""
 
         missing_summary_attr_emails = sorted(list(sales_conversion_emails_set - set(summary_attr["email"].dropna().unique())))
         if missing_summary_attr_emails:
@@ -1048,11 +1149,19 @@ def main():
         joined_nonzero_export = joined_nonzero.copy()
         joined_nonzero_export["labels_list"] = joined_nonzero_export["labels_list"].apply(lambda x: ", ".join(x) if isinstance(x, list) else "")
 
+        deduped_leads_source_export = deduped_leads_source.copy()
+        deduped_leads_source_export["labels_list"] = deduped_leads_source_export["labels_list"].apply(lambda x: ", ".join(x) if isinstance(x, list) else "")
+
+        summary_attr_export = summary_attr.copy()
+        summary_attr_export["labels_list"] = summary_attr_export["labels_list"].apply(lambda x: ", ".join(x) if isinstance(x, list) else "")
+
         logs_df = pd.DataFrame({"log": logs})
 
         excel_name, excel_bytes = _build_excel(
             leads_with_payments=joined_export,
             leads_nonzero=joined_nonzero_export,
+            deduped_leads_source=deduped_leads_source_export,
+            summary_attribution_base=summary_attr_export,
             email_summary=joined,
             owner_summary=owner_summary,
             owner_x_connected=owner_x_connected,
@@ -1197,6 +1306,8 @@ def main():
         st.dataframe(joined_export, use_container_width=True)
         st.markdown("#### Leads with non-zero payments only")
         st.dataframe(joined_nonzero_export, use_container_width=True)
+        st.markdown("#### Deduplicated lead source sheet (one row per email)")
+        st.dataframe(deduped_leads_source_export, use_container_width=True)
 
     with tab_summaries:
         st.markdown("#### Owner Summary")
