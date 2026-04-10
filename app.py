@@ -27,7 +27,9 @@ KC_DEEP = "#8030F0"
 KC_SOFT = "#F6F0FF"
 
 EXCLUDED_OWNER_CANON = "pipedrive krispcall"
-CREDIT_EXCLUDE_DESCS = {"purchased credit", "credit purchased", "amount recharged"}
+CREDIT_EXCLUDE_DESCS = {"purchased credit", "credit purchased", "amount recharged"}a
+SUBSCRIPTION_MATCH_TERMS = ("workspace subscription", "starter,", "advance,")
+SUBSCRIPTION_MATCH_REGEX = "|".join(re.escape(x) for x in SUBSCRIPTION_MATCH_TERMS)
 
 
 # =========================
@@ -177,6 +179,12 @@ def _parse_time_to_dt(series: pd.Series) -> pd.Series:
     if float(t.median()) > 1e11:  # ms epoch
         t = (t // 1000)
     return pd.to_datetime(t, unit="s", utc=True)
+
+
+def _subscription_description_mask(series: pd.Series) -> pd.Series:
+    if series is None:
+        return pd.Series(dtype=bool)
+    return series.astype(str).str.contains(SUBSCRIPTION_MATCH_REGEX, case=False, na=False)
 
 
 # =========================
@@ -434,7 +442,7 @@ def _windowed_email_summary(
         trigger = False
         start = None
         if desc_col and desc_col in g.columns:
-            mask = g[desc_col].astype(str).str.contains("Workspace Subscription", case=False, na=False)
+            mask = _subscription_description_mask(g[desc_col])
             if mask.any():
                 trigger = True
                 start = g.loc[mask, "_dt"].min()
@@ -881,10 +889,10 @@ def main():
         overall_ref_sum = float(refunds[refund_amount_col].sum()) if not refunds.empty else 0.0
         metric_overall_revenue = float(overall_rev_sum - overall_ref_sum)
 
-        # Overall Conversion set (Workspace Subscription payments only)
+        # Overall Conversion set (payments whose Amount Description matches Workspace Subscription, Starter,, or Advance,)
         sub_mask = pd.Series(False, index=payments.index)
         if desc_col and desc_col in payments.columns:
-            sub_mask = payments[desc_col].astype(str).str.contains("workspace subscription", case=False, na=False)
+            sub_mask = _subscription_description_mask(payments[desc_col])
 
         overall_conversion_emails = set(
             payments.loc[sub_mask, "email"].dropna().astype(str).str.strip().str.lower().unique()
@@ -955,6 +963,10 @@ def main():
             logs.append(
                 f"AUDIT FAIL: {len(missing_summary_attr_emails)} Sales Conversion email(s) could not be attributed to the deduped non-Pipedrive summary base."
             )
+        else:
+            logs.append(
+                f"Deduplicated sales-converted attribution base prepared with {int(summary_attr['email'].nunique())} unique email(s)."
+            )
 
         # Segment revenue helpers
         def calc_segment_metrics(emails_list: List[str]):
@@ -988,9 +1000,9 @@ def main():
         # Overall Metrics table
         overall_metrics_data = [
             {"Group": "Overall", "Metric": "Overall Revenue (Period)", "Value": metric_overall_revenue, "Description": "Payments minus refunds in selected range"},
-            {"Group": "Overall", "Metric": "Overall Conversion", "Value": metric_overall_conversions, "Description": 'Unique emails where Amount Description contains "Workspace Subscription"'},
+            {"Group": "Overall", "Metric": "Overall Conversion", "Value": metric_overall_conversions, "Description": 'Unique emails where Amount Description contains any of: Workspace Subscription, Starter,, Advance,'},
 
-            {"Group": "Self Converted", "Metric": "Self-Converted Count (Conversion Count)", "Value": self_converted_count, "Description": 'Conversion emails where Amount Description contains "Workspace Subscription", with no lead or first deduped lead owner = Pipedrive KrispCall'},
+            {"Group": "Self Converted", "Metric": "Self-Converted Count (Conversion Count)", "Value": self_converted_count, "Description": 'Conversion emails where Amount Description contains any of: Workspace Subscription, Starter,, Advance,, with no lead or first deduped lead owner = Pipedrive KrispCall'},
             {"Group": "Self Converted", "Metric": "Self-Converted Net Revenue (Whole Period)", "Value": sc_period_net, "Description": "Net revenue in range for self converted conversion emails"},
             {"Group": "Self Converted", "Metric": "Self-Converted Net Revenue (7 day)", "Value": sc_7d_net, "Description": "7-day window net revenue for self converted conversion emails"},
 
@@ -1149,11 +1161,12 @@ def main():
         joined_nonzero_export = joined_nonzero.copy()
         joined_nonzero_export["labels_list"] = joined_nonzero_export["labels_list"].apply(lambda x: ", ".join(x) if isinstance(x, list) else "")
 
-        deduped_leads_source_export = deduped_leads_source.copy()
-        deduped_leads_source_export["labels_list"] = deduped_leads_source_export["labels_list"].apply(lambda x: ", ".join(x) if isinstance(x, list) else "")
-
         summary_attr_export = summary_attr.copy()
         summary_attr_export["labels_list"] = summary_attr_export["labels_list"].apply(lambda x: ", ".join(x) if isinstance(x, list) else "")
+
+        # The deduped source sheet should be the canonical Sales Conversion attribution base:
+        # one row per sales-converted email, with all joined payment fields.
+        deduped_leads_source_export = summary_attr_export.copy()
 
         logs_df = pd.DataFrame({"log": logs})
 
@@ -1261,6 +1274,7 @@ def main():
 
         # Download for audit classification
         audit_csv_bytes = conversion_classification_df.to_csv(index=False).encode("utf-8")
+        deduped_sales_converted_csv_bytes = summary_attr_export.to_csv(index=False).encode("utf-8")
 
     # =========================
     # UI TABS
@@ -1306,7 +1320,7 @@ def main():
         st.dataframe(joined_export, use_container_width=True)
         st.markdown("#### Leads with non-zero payments only")
         st.dataframe(joined_nonzero_export, use_container_width=True)
-        st.markdown("#### Deduplicated lead source sheet (one row per email)")
+        st.markdown("#### Deduplicated sales-converted lead list (one row per converted email, includes payment data)")
         st.dataframe(deduped_leads_source_export, use_container_width=True)
 
     with tab_summaries:
@@ -1373,6 +1387,12 @@ def main():
             data=excel_bytes,
             file_name=excel_name,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        st.download_button(
+            "Download deduplicated sales-converted CSV",
+            data=deduped_sales_converted_csv_bytes,
+            file_name="deduplicated_sales_converted_leads.csv",
+            mime="text/csv",
         )
 
     with tab_logs:
