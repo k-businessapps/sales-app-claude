@@ -31,6 +31,15 @@ CREDIT_EXCLUDE_DESCS = {"purchased credit", "credit purchased", "amount recharge
 SUBSCRIPTION_MATCH_TERMS = ("workspace subscription", "starter,", "advance,")
 SUBSCRIPTION_MATCH_REGEX = "|".join(re.escape(x) for x in SUBSCRIPTION_MATCH_TERMS)
 
+CONNECTED_NEGATIVE_TOKENS = (
+    "not connected",
+    "hung up",
+    "voicemail",
+    "not answered",
+    "invalid phone number",
+    "unresponsive",
+)
+
 
 # =========================
 # Secrets + UI helpers
@@ -274,12 +283,35 @@ def _split_labels(value) -> List[str]:
     return [p for p in parts if p]
 
 
-def _connected_from_labels(labels: List[str]) -> bool:
-    labs = [str(l).strip().lower() for l in (labels or [])]
+def _connected_from_labels(labels: List[str]) -> Optional[bool]:
+    labs = [str(l).strip().lower() for l in (labels or []) if str(l).strip()]
+    if not labs:
+        return None
     if any(l == "not connected" for l in labs):
         return False
     if any("connected" in l for l in labs):
         return True
+    return None
+
+
+def _connected_from_reach_status(value) -> Optional[bool]:
+    status = _norm_text(value)
+    if not status:
+        return None
+    if any(token in status for token in CONNECTED_NEGATIVE_TOKENS):
+        return False
+    if "connected" in status:
+        return True
+    return None
+
+
+def _derive_connected(labels: List[str], reach_status) -> bool:
+    reach_connected = _connected_from_reach_status(reach_status)
+    if reach_connected is not None:
+        return reach_connected
+    label_connected = _connected_from_labels(labels)
+    if label_connected is not None:
+        return label_connected
     return False
 
 
@@ -395,6 +427,23 @@ def _expand_leads_for_multiple_emails(df: pd.DataFrame, email_cols_priority: Lis
             expanded.append(rec)
 
     return pd.DataFrame(expanded), missing_rows
+
+
+def _apply_standard_lead_filters(df: pd.DataFrame, country_col: Optional[str], labels_col: Optional[str]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df.copy()
+
+    out = df.copy()
+
+    mask_india = pd.Series(False, index=out.index)
+    if country_col and country_col in out.columns:
+        mask_india = out[country_col].apply(_norm_text).eq("india")
+
+    mask_junk = pd.Series(False, index=out.index)
+    if labels_col and labels_col in out.columns:
+        mask_junk = out[labels_col].astype(str).str.contains("junk lead", case=False, na=False)
+
+    return out[~mask_india & ~mask_junk].copy()
 
 
 # =========================
@@ -689,6 +738,7 @@ def main():
         owner_col = _pick_first_existing_column(leads_raw, ["Lead - Owner", "Deal - Owner", "Owner", "owner"]) or "Owner"
         created_col = _pick_first_existing_column(leads_raw, ["Lead - Lead created on", "Lead created on", "Created on"])
         label_col = _pick_first_existing_column(leads_raw, ["Lead - Label", "Label", "Labels", "Lead - Labels"])
+        reach_status_col = _pick_first_existing_column(leads_raw, ["Lead - Reach Status", "Reach Status", "Lead Reach Status"])
 
         email_cols_priority: List[str] = []
         for cand in ["Person - Email", "Lead - User Email"]:
@@ -708,7 +758,15 @@ def main():
         else:
             expanded_leads["labels_list"] = [[] for _ in range(len(expanded_leads))]
 
-        expanded_leads["Connected"] = expanded_leads["labels_list"].apply(_connected_from_labels)
+        if reach_status_col and reach_status_col in expanded_leads.columns:
+            expanded_leads["Reach_Status_Value"] = expanded_leads[reach_status_col]
+        else:
+            expanded_leads["Reach_Status_Value"] = None
+
+        expanded_leads["Connected"] = expanded_leads.apply(
+            lambda row: _derive_connected(row["labels_list"], row.get("Reach_Status_Value")),
+            axis=1,
+        )
         expanded_leads["Lead Source"] = expanded_leads["labels_list"].apply(_derive_lead_source)
 
         if created_col and created_col in expanded_leads.columns:
@@ -733,27 +791,20 @@ def main():
             .copy()
         )
 
-        # Lead Count metrics base (before dedup). Exclude India and Junk Lead for Leads Generated.
         country_col = _pick_first_existing_column(leads_raw, ["Person - Country", "Country", "Person Country"])
         labels_raw_col = label_col
 
-        lead_counts_base = expanded_leads.copy()
+        # Lead count base for summary tables should come from the deduplicated lead table,
+        # not from the converted-only attribution base.
+        deduped_generated_df = _apply_standard_lead_filters(deduped_leads_source, country_col, labels_raw_col)
+        deduped_attempted_df = deduped_generated_df[
+            ~deduped_generated_df[owner_col].apply(_norm_text).eq(EXCLUDED_OWNER_CANON)
+        ].copy()
+        deduped_connected_df = deduped_attempted_df[deduped_attempted_df["Connected"] == True].copy()
 
-        mask_india = pd.Series(False, index=lead_counts_base.index)
-        if country_col and country_col in lead_counts_base.columns:
-            mask_india = lead_counts_base[country_col].apply(_norm_text).eq("india")
-
-        mask_junk = pd.Series(False, index=lead_counts_base.index)
-        if labels_raw_col and labels_raw_col in lead_counts_base.columns:
-            mask_junk = lead_counts_base[labels_raw_col].astype(str).str.contains("junk lead", case=False, na=False)
-
-        leads_generated_df = lead_counts_base[~mask_india & ~mask_junk].copy()
-        leads_attempted_df = leads_generated_df[~leads_generated_df[owner_col].apply(_norm_text).eq(EXCLUDED_OWNER_CANON)].copy()
-        leads_connected_df = leads_attempted_df[leads_attempted_df["Connected"] == True].copy()
-
-        metric_leads_generated = int(len(leads_generated_df))
-        metric_leads_attempted = int(len(leads_attempted_df))
-        metric_leads_connected = int(len(leads_connected_df))
+        metric_leads_generated = int(deduped_generated_df["email"].nunique())
+        metric_leads_attempted = int(deduped_attempted_df["email"].nunique())
+        metric_leads_connected = int(deduped_connected_df["email"].nunique())
 
         lead_count_relation_ok = (metric_leads_connected <= metric_leads_attempted <= metric_leads_generated)
         if not lead_count_relation_ok:
@@ -761,6 +812,13 @@ def main():
                 f"AUDIT FAIL: Lead counts relationship unexpected. Generated={metric_leads_generated}, "
                 f"Attempted={metric_leads_attempted}, Connected={metric_leads_connected}"
             )
+
+        logs.append(
+            "Connected logic: Reach Status is checked first. Explicit negative statuses such as "
+            "Not Connected, Hung Up, Voicemail, Not Answered, Invalid Phone Number, and Unresponsive "
+            "set Connected=False. Reach Status values containing Connected set Connected=True. "
+            "If Reach Status is blank, labels are used as fallback."
+        )
 
         # Mixpanel
         pid = int(_get_secret(["mixpanel", "project_id"]))
@@ -1013,41 +1071,67 @@ def main():
             {"Group": "Sales Conversions", "Metric": "Sales Conversion Revenue (7 day)", "Value": sales_conv_7d_net, "Description": "7-day window net for sales conversion emails"},
             {"Group": "Sales Conversions", "Metric": "Sales Effort Revenue (7 day)", "Value": sales_effort_7d_net, "Description": "7-day window net for sales effort conversion emails"},
 
-            {"Group": "Lead Count", "Metric": "Leads Generated", "Value": metric_leads_generated, "Description": 'Lead rows excluding Person - Country "India" and Lead - Label containing "Junk Lead". Counted before dedup'},
-            {"Group": "Lead Count", "Metric": "Leads Attempted", "Value": metric_leads_attempted, "Description": "Leads Generated excluding owner Pipedrive KrispCall. Counted before dedup"},
-            {"Group": "Lead Count", "Metric": "Lead Connected", "Value": metric_leads_connected, "Description": "Connected leads excluding owner Pipedrive KrispCall. Counted before dedup"},
+            {"Group": "Lead Count", "Metric": "Leads Generated", "Value": metric_leads_generated, "Description": 'Unique deduplicated lead emails excluding Person - Country "India" and Lead - Label containing "Junk Lead"'},
+            {"Group": "Lead Count", "Metric": "Leads Attempted", "Value": metric_leads_attempted, "Description": "Unique deduplicated lead emails after Leads Generated filters, excluding owner Pipedrive KrispCall"},
+            {"Group": "Lead Count", "Metric": "Lead Connected", "Value": metric_leads_connected, "Description": "Unique deduplicated attempted lead emails marked Connected using Reach Status first, then labels as fallback"},
         ]
         overall_metrics_df = pd.DataFrame(overall_metrics_data)
 
         # Summaries Construction
         summ_cols = numeric_cols_7d + numeric_cols_period
 
-        def build_summary(group_cols: List[str], df_attr: pd.DataFrame):
-            if df_attr.empty:
-                return pd.DataFrame(columns=group_cols + summ_cols + ["Lead_Count", "Converted_Users", "Paying_Users"])
+        def build_summary(group_cols: List[str], df_attr: pd.DataFrame, lead_count_df: Optional[pd.DataFrame] = None):
+            empty_cols = group_cols + ["Lead_Count", "Converted_Users", "Paying_Users"] + summ_cols
+            if (df_attr is None or df_attr.empty) and (lead_count_df is None or lead_count_df.empty):
+                return pd.DataFrame(columns=empty_cols)
 
-            rev = df_attr.groupby(group_cols, dropna=False, as_index=False)[summ_cols].sum()
-            converted = (
-                df_attr.groupby(group_cols, dropna=False, as_index=False)["email"]
-                .nunique()
-                .rename(columns={"email": "Converted_Users"})
-            )
+            rev = pd.DataFrame(columns=group_cols + summ_cols)
+            if df_attr is not None and not df_attr.empty:
+                rev = df_attr.groupby(group_cols, dropna=False, as_index=False)[summ_cols].sum()
 
-            final = rev.merge(converted, on=group_cols, how="outer").fillna(0)
-            final["Lead_Count"] = final["Converted_Users"]
-            # Backward-compatible column name for existing workbook readers.
+            converted = pd.DataFrame(columns=group_cols + ["Converted_Users"])
+            if df_attr is not None and not df_attr.empty:
+                converted = (
+                    df_attr.groupby(group_cols, dropna=False, as_index=False)["email"]
+                    .nunique()
+                    .rename(columns={"email": "Converted_Users"})
+                )
+
+            lead_counts = pd.DataFrame(columns=group_cols + ["Lead_Count"])
+            if lead_count_df is not None and not lead_count_df.empty:
+                lead_counts = (
+                    lead_count_df.groupby(group_cols, dropna=False, as_index=False)["email"]
+                    .nunique()
+                    .rename(columns={"email": "Lead_Count"})
+                )
+
+            final = lead_counts.merge(converted, on=group_cols, how="outer")
+            final = final.merge(rev, on=group_cols, how="outer").fillna(0)
+
+            if "Lead_Count" not in final.columns:
+                final["Lead_Count"] = 0
+            if "Converted_Users" not in final.columns:
+                final["Converted_Users"] = 0
+
             final["Paying_Users"] = final["Converted_Users"]
 
             ordered_cols = group_cols + ["Lead_Count", "Converted_Users", "Paying_Users"] + summ_cols
             final = final[[c for c in ordered_cols if c in final.columns]]
 
+            numeric_to_int = ["Lead_Count", "Converted_Users", "Paying_Users"]
+            for c in numeric_to_int:
+                if c in final.columns:
+                    final[c] = pd.to_numeric(final[c], errors="coerce").fillna(0).astype(int)
+
             if "Period_Net_Amount" in final.columns:
                 final = final.sort_values("Period_Net_Amount", ascending=False)
             return final
 
-        owner_summary = build_summary([owner_col], summary_attr)
-        connected_summary = build_summary(["Connected"], summary_attr)
-        owner_x_connected = build_summary([owner_col, "Connected"], summary_attr)
+        summary_lead_counts_base = deduped_attempted_df.copy()
+
+        owner_summary = build_summary([owner_col], summary_attr, summary_lead_counts_base)
+        connected_summary = build_summary(["Connected"], summary_attr, summary_lead_counts_base)
+        owner_x_connected = build_summary([owner_col, "Connected"], summary_attr, summary_lead_counts_base)
 
         labels_attr = summary_attr.explode("labels_list").rename(columns={"labels_list": "Label"})
         labels_attr["Label"] = labels_attr["Label"].fillna("").astype(str).str.strip()
@@ -1056,14 +1140,23 @@ def main():
             lambda s: False if s.strip() == "not connected" else ("connected" in s)
         )
 
-        label_summary = build_summary(["Label", "Connected_Label"], labels_attr)
+        lead_count_labels_attr = summary_lead_counts_base.explode("labels_list").rename(columns={"labels_list": "Label"})
+        lead_count_labels_attr["Label"] = lead_count_labels_attr["Label"].fillna("").astype(str).str.strip()
+        lead_count_labels_attr = lead_count_labels_attr[lead_count_labels_attr["Label"] != ""].copy()
+        lead_count_labels_attr["Connected_Label"] = lead_count_labels_attr["Label"].str.lower().apply(
+            lambda s: False if s.strip() == "not connected" else ("connected" in s)
+        )
+
+        label_summary = build_summary(["Label", "Connected_Label"], labels_attr, lead_count_labels_attr)
 
         summary_attr["Lead_Created_Date"] = summary_attr["_lead_created_dt"].dt.date
-        time_summary = build_summary(["Lead_Created_Date"], summary_attr).sort_values("Lead_Created_Date")
+        summary_lead_counts_base["Lead_Created_Date"] = summary_lead_counts_base["_lead_created_dt"].dt.date
+        time_summary = build_summary(["Lead_Created_Date"], summary_attr, summary_lead_counts_base).sort_values("Lead_Created_Date")
 
         # Hour of day summary
         summary_attr["Lead_Created_Hour"] = pd.to_datetime(summary_attr["_lead_created_dt"], errors="coerce").dt.hour
-        hour_summary = build_summary(["Lead_Created_Hour"], summary_attr).copy()
+        summary_lead_counts_base["Lead_Created_Hour"] = pd.to_datetime(summary_lead_counts_base["_lead_created_dt"], errors="coerce").dt.hour
+        hour_summary = build_summary(["Lead_Created_Hour"], summary_attr, summary_lead_counts_base).copy()
 
         def _hour_label(v):
             try:
@@ -1164,9 +1257,10 @@ def main():
         summary_attr_export = summary_attr.copy()
         summary_attr_export["labels_list"] = summary_attr_export["labels_list"].apply(lambda x: ", ".join(x) if isinstance(x, list) else "")
 
-        # The deduped source sheet should be the canonical Sales Conversion attribution base:
-        # one row per sales-converted email, with all joined payment fields.
-        deduped_leads_source_export = summary_attr_export.copy()
+        deduped_leads_source_export = deduped_leads_source.copy()
+        deduped_leads_source_export["labels_list"] = deduped_leads_source_export["labels_list"].apply(
+            lambda x: ", ".join(x) if isinstance(x, list) else ""
+        )
 
         logs_df = pd.DataFrame({"log": logs})
 
@@ -1222,9 +1316,9 @@ def main():
                 {"Metric": "Owner x Connected Converted total", "Value": owner_connected_summary_total_converted},
                 {"Metric": "Time Summary Converted total", "Value": time_summary_total_converted},
                 {"Metric": "Hour Summary Converted total", "Value": hour_summary_total_converted},
-                {"Metric": "Leads Generated (rows)", "Value": metric_leads_generated},
-                {"Metric": "Leads Attempted (rows)", "Value": metric_leads_attempted},
-                {"Metric": "Lead Connected (rows)", "Value": metric_leads_connected},
+                {"Metric": "Leads Generated (deduped emails)", "Value": metric_leads_generated},
+                {"Metric": "Leads Attempted (deduped emails)", "Value": metric_leads_attempted},
+                {"Metric": "Lead Connected (deduped emails)", "Value": metric_leads_connected},
             ]
         )
 
@@ -1320,12 +1414,18 @@ def main():
         st.dataframe(joined_export, use_container_width=True)
         st.markdown("#### Leads with non-zero payments only")
         st.dataframe(joined_nonzero_export, use_container_width=True)
-        st.markdown("#### Deduplicated sales-converted lead list (one row per converted email, includes payment data)")
+        st.markdown("#### Deduplicated leads by email (one row per lead email before conversion filtering)")
         st.dataframe(deduped_leads_source_export, use_container_width=True)
+
+        st.markdown("#### Sales-converted attribution base (one row per converted email, includes payment data)")
+        st.dataframe(summary_attr_export, use_container_width=True)
 
     with tab_summaries:
         st.markdown("#### Owner Summary")
         st.dataframe(_style_totals_row(_add_totals_row(owner_summary, label_col=owner_col)), use_container_width=True)
+
+        st.markdown("#### Owner x Connected Summary")
+        st.dataframe(_style_totals_row(_add_totals_row(owner_x_connected, label_col=owner_col)), use_container_width=True)
 
         st.markdown("#### Connected Summary")
         st.dataframe(_style_totals_row(_add_totals_row(connected_summary, label_col="Connected")), use_container_width=True)
