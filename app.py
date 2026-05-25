@@ -28,7 +28,7 @@ KC_SOFT = "#F6F0FF"
 
 EXCLUDED_OWNER_CANON = "pipedrive krispcall"
 CREDIT_EXCLUDE_DESCS = {"purchased credit", "credit purchased", "amount recharged"}
-SUBSCRIPTION_MATCH_TERMS = ("workspace subscription", "starter,", "advance,")
+SUBSCRIPTION_MATCH_TERMS = ("workspace subscription", "starter", "advance")
 SUBSCRIPTION_MATCH_REGEX = "|".join(re.escape(x) for x in SUBSCRIPTION_MATCH_TERMS)
 
 CONNECTED_NEGATIVE_TOKENS = (
