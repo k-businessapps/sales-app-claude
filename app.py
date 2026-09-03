@@ -541,8 +541,14 @@ def _strict_range_email_summary(
     Strict selected range summation (Period Revenue) per email.
     """
     def get_sums(df, group_col, sum_col, out_col):
-        if df.empty:
-            return pd.Series(dtype=float)
+        if (
+            df is None
+            or df.empty
+            or group_col not in df.columns
+            or sum_col not in df.columns
+        ):
+            return pd.Series(dtype=float, name=out_col)
+
         return df.groupby(group_col)[sum_col].sum().rename(out_col)
 
     p_gross = get_sums(payments_gross, "email", amount_col, "Period_Total_Amount")
@@ -553,6 +559,16 @@ def _strict_range_email_summary(
     df = pd.concat([p_gross, p_ce, r_gross, r_ce], axis=1).fillna(0.0)
     df.index.name = "email"
     df = df.reset_index()
+
+    expected_cols = [
+        "Period_Total_Amount",
+        "Period_Total_Amount_creditExcluded",
+        "Period_Refund_Amount",
+        "Period_Refund_Amount_creditExcluded",
+    ]
+    for col in expected_cols:
+        if col not in df.columns:
+            df[col] = 0.0
 
     df["Period_Net_Amount"] = df["Period_Total_Amount"] - df["Period_Refund_Amount"]
     df["Period_Net_Amount_creditExcluded"] = df["Period_Total_Amount_creditExcluded"] - df["Period_Refund_Amount_creditExcluded"]
