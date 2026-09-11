@@ -30,6 +30,8 @@ EXCLUDED_OWNER_CANON = "pipedrive krispcall"
 CREDIT_EXCLUDE_DESCS = {"purchased credit", "credit purchased", "amount recharged"}
 SUBSCRIPTION_MATCH_TERMS = ("workspace subscription", "starter", "advance", "KrispCall Max")
 SUBSCRIPTION_MATCH_REGEX = "|".join(re.escape(x) for x in SUBSCRIPTION_MATCH_TERMS)
+FIRST_SUBSCRIPTION_EXCLUDE_TERMS = ("Prorated Charges", "Upgraded to")
+FIRST_SUBSCRIPTION_EXCLUDE_REGEX = "|".join(re.escape(x) for x in FIRST_SUBSCRIPTION_EXCLUDE_TERMS)
 
 CONNECTED_NEGATIVE_TOKENS = (
     "not connected",
@@ -191,9 +193,23 @@ def _parse_time_to_dt(series: pd.Series) -> pd.Series:
 
 
 def _subscription_description_mask(series: pd.Series) -> pd.Series:
+    """
+    Identify first-subscription payment descriptions.
+
+    A description must contain one of the subscription match terms and must NOT
+    contain excluded upgrade/proration phrases. Matching is case-insensitive.
+    """
     if series is None:
         return pd.Series(dtype=bool)
-    return series.astype(str).str.contains(SUBSCRIPTION_MATCH_REGEX, case=False, na=False)
+
+    descriptions = series.astype(str)
+    matches_subscription = descriptions.str.contains(
+        SUBSCRIPTION_MATCH_REGEX, case=False, na=False
+    )
+    matches_exclusion = descriptions.str.contains(
+        FIRST_SUBSCRIPTION_EXCLUDE_REGEX, case=False, na=False
+    )
+    return matches_subscription & ~matches_exclusion
 
 
 # =========================
@@ -963,7 +979,7 @@ def main():
         overall_ref_sum = float(refunds[refund_amount_col].sum()) if not refunds.empty else 0.0
         metric_overall_revenue = float(overall_rev_sum - overall_ref_sum)
 
-        # Overall Conversion set (payments whose Amount Description matches Workspace Subscription, Starter,, or Advance,)
+        # Overall Conversion set (first-subscription matches, excluding Prorated Charges and Upgraded to descriptions)
         sub_mask = pd.Series(False, index=payments.index)
         if desc_col and desc_col in payments.columns:
             sub_mask = _subscription_description_mask(payments[desc_col])
@@ -1074,9 +1090,9 @@ def main():
         # Overall Metrics table
         overall_metrics_data = [
             {"Group": "Overall", "Metric": "Overall Revenue (Period)", "Value": metric_overall_revenue, "Description": "Payments minus refunds in selected range"},
-            {"Group": "Overall", "Metric": "Overall Conversion", "Value": metric_overall_conversions, "Description": 'Unique emails where Amount Description contains any of: Workspace Subscription, Starter,, Advance,'},
+            {"Group": "Overall", "Metric": "Overall Conversion", "Value": metric_overall_conversions, "Description": 'Unique emails where Amount Description contains a subscription match term, excluding descriptions containing Prorated Charges or Upgraded to (case-insensitive)'},
 
-            {"Group": "Self Converted", "Metric": "Self-Converted Count (Conversion Count)", "Value": self_converted_count, "Description": 'Conversion emails where Amount Description contains any of: Workspace Subscription, Starter,, Advance,, with no lead or first deduped lead owner = Pipedrive KrispCall'},
+            {"Group": "Self Converted", "Metric": "Self-Converted Count (Conversion Count)", "Value": self_converted_count, "Description": 'Conversion emails matching the first-subscription description logic, excluding Prorated Charges or Upgraded to, with no lead or first deduped lead owner = Pipedrive KrispCall'},
             {"Group": "Self Converted", "Metric": "Self-Converted Net Revenue (Whole Period)", "Value": sc_period_net, "Description": "Net revenue in range for self converted conversion emails"},
             {"Group": "Self Converted", "Metric": "Self-Converted Net Revenue (7 day)", "Value": sc_7d_net, "Description": "7-day window net revenue for self converted conversion emails"},
 
